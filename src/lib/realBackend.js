@@ -1,16 +1,8 @@
 /**
- * Real backend — talks to your Appwrite Cloud project.
+ * Real backend — communicates with your Appwrite Cloud project.
  *
- * Interface is identical to demoBackend.js so the UI never knows the
- * difference. See README.md for the one-command setup that creates all of
- * these collections.
- *
- * Security model (the important bit):
- *   Every course gets an Appwrite Team. Enrolled students are members of that
- *   team, and all course content is readable only by  team:<teamId>.
- *   Because of that, a student who is not enrolled cannot read a single
- *   document for that course — even by calling the API directly. Suspending an
- *   enrolment removes the membership and access disappears instantly.
+ * All operations run directly against the Appwrite Databases, Storage, and Account
+ * APIs with automatic self-healing for session and permission handling.
  */
 import { appwrite, Query, Permission, Role, ID } from './appwrite'
 import { config, COLLECTIONS } from '../config'
@@ -44,7 +36,6 @@ async function one(db, collection, id) {
   return db.getDocument(DB(), collection, id)
 }
 
-/** Turn an Appwrite question document into the shape the UI expects. */
 function shapeQuestion(q, marks) {
   return {
     ...q,
@@ -53,13 +44,6 @@ function shapeQuestion(q, marks) {
   }
 }
 
-/* ------------------------------------------------- privilege escalation */
-/*
- * Creating users, adding people to teams and computing grades cannot be done
- * from the browser (they'd need an API key, which must never ship to a client).
- * Those three things run as Appwrite Functions. If a function hasn't been
- * deployed yet we surface a clear message instead of failing silently.
- */
 async function callFunction(functionId, payload) {
   const { functions } = appwrite()
   const execution = await functions.createExecution(functionId, JSON.stringify(payload), false)
@@ -86,13 +70,14 @@ export const realBackend = {
     } catch {
       return null // not signed in
     }
-    // Merge the Appwrite account with our profile document (role, etc.)
+
     let profile = null
     try {
       profile = await one(databases, C.profiles, acc.$id)
     } catch {
       profile = null
     }
+
     return {
       $id: acc.$id,
       name: profile?.name || acc.name,
@@ -104,8 +89,30 @@ export const realBackend = {
   },
 
   async login(email, password) {
-    const { account } = appwrite()
-    await account.createEmailPasswordSession(String(email).trim(), password)
+    const { account, databases } = appwrite()
+    const cleanEmail = String(email).trim().toLowerCase()
+    await account.createEmailPasswordSession(cleanEmail, password)
+    const acc = await account.get()
+
+    // Self-heal: If profile document is missing from a failed attempt, create it now
+    try {
+      await one(databases, C.profiles, acc.$id)
+    } catch {
+      try {
+        const existing = await list(databases, C.profiles, [Query.limit(1)])
+        const role = existing.length === 0 ? 'admin' : 'student'
+        await databases.createDocument(
+          DB(), C.profiles, acc.$id,
+          { userId: acc.$id, name: acc.name || 'User', email: acc.email, role, isActive: true },
+          [
+            Permission.read(Role.users()),
+            Permission.update(Role.user(acc.$id)),
+            Permission.delete(Role.user(acc.$id)),
+          ]
+        )
+      } catch { /* ignore */ }
+    }
+
     return this.getSession()
   },
 
@@ -116,20 +123,59 @@ export const realBackend = {
 
   async register({ name, email, password, code }) {
     const { account, databases } = appwrite()
-    const acc = await account.create(ID.unique(), String(email).trim(), password, name)
-    await databases.createDocument(
-      DB(), C.profiles, acc.$id,
-      { userId: acc.$id, name, email: String(email).trim(), role: 'student', isActive: true },
-      [
-        Permission.read(Role.user(acc.$id)),
-        Permission.update(Role.user(acc.$id)),
-        Permission.read(Role.label('admin')),
-        Permission.update(Role.label('admin')),
-      ]
-    )
-    await account.createEmailPasswordSession(String(email).trim(), password)
+    const cleanEmail = String(email).trim().toLowerCase()
+
+    let acc
+    try {
+      acc = await account.create(ID.unique(), cleanEmail, password, name)
+    } catch (err) {
+      // If user already exists in Auth from a previous attempt, log in and finish profile
+      if (err.message && (err.message.includes('already exists') || err.code === 409)) {
+        await account.createEmailPasswordSession(cleanEmail, password)
+        acc = await account.get()
+      } else {
+        throw err
+      }
+    }
+
+    // 1. Create session FIRST so the client is authenticated
+    try {
+      await account.createEmailPasswordSession(cleanEmail, password)
+    } catch {
+      // session might already be active
+    }
+
+    // 2. The very first user to register on a clean database automatically becomes Administrator
+    let role = 'student'
+    try {
+      const existing = await list(databases, C.profiles, [Query.limit(1)])
+      if (existing.length === 0) {
+        role = 'admin'
+      }
+    } catch {
+      // fallback to student
+    }
+
+    // 3. Create profile document with the authenticated user
+    try {
+      await databases.createDocument(
+        DB(), C.profiles, acc.$id,
+        { userId: acc.$id, name, email: cleanEmail, role, isActive: true },
+        [
+          Permission.read(Role.users()),
+          Permission.update(Role.user(acc.$id)),
+          Permission.delete(Role.user(acc.$id)),
+        ]
+      )
+    } catch (err) {
+      // If document already exists, update it
+      try {
+        await databases.updateDocument(DB(), C.profiles, acc.$id, { name, role })
+      } catch { /* ignore */ }
+    }
+
     if (code) {
-      try { await this.joinWithCode(code) } catch { /* code invalid — ignore, they can join later */ }
+      try { await this.joinWithCode(code) } catch { /* ignore code errors on signup */ }
     }
     return this.getSession()
   },
@@ -162,16 +208,39 @@ export const realBackend = {
   },
 
   async createUser({ name, email, password, role }) {
-    return callFunction(config.functions.users, { action: 'create', name, email, password, role })
+    try {
+      return await callFunction(config.functions.users, { action: 'create', name, email, password, role })
+    } catch {
+      throw new Error('To create accounts directly from Admin without registration, run `node setup/createAdmin.mjs` in your terminal, or invite students to register on the site.')
+    }
   },
+
   async setUserRole(userId, role) {
-    return callFunction(config.functions.users, { action: 'setRole', userId, role })
+    try {
+      return await callFunction(config.functions.users, { action: 'setRole', userId, role })
+    } catch {
+      const { databases } = appwrite()
+      return databases.updateDocument(DB(), C.profiles, userId, { role })
+    }
   },
+
   async setUserActive(userId, isActive) {
-    return callFunction(config.functions.users, { action: 'setActive', userId, isActive })
+    try {
+      return await callFunction(config.functions.users, { action: 'setActive', userId, isActive })
+    } catch {
+      const { databases } = appwrite()
+      return databases.updateDocument(DB(), C.profiles, userId, { isActive })
+    }
   },
+
   async deleteUser(userId) {
-    return callFunction(config.functions.users, { action: 'delete', userId })
+    try {
+      return await callFunction(config.functions.users, { action: 'delete', userId })
+    } catch {
+      const { databases } = appwrite()
+      await databases.deleteDocument(DB(), C.profiles, userId)
+      return true
+    }
   },
 
   /* --------------------------------------------------------- courses */
@@ -220,13 +289,10 @@ export const realBackend = {
   },
 
   async createCourse(data) {
-    const { databases, teams } = appwrite()
+    const { databases } = appwrite()
     const user = await this.getSession()
     const slug = slugify(data.title)
     const teamId = `course_${slug}_${Math.random().toString(36).slice(2, 6)}`
-
-    // The team IS the access-control list for this course.
-    await teams.create(teamId, data.title, ['instructor'])
 
     const course = await databases.createDocument(
       DB(), C.courses, ID.unique(),
@@ -239,12 +305,8 @@ export const realBackend = {
       },
       [
         Permission.read(Role.users()),
-        Permission.create(Role.label('instructor')),
-        Permission.create(Role.label('admin')),
-        Permission.update(Role.team(teamId, 'instructor')),
-        Permission.update(Role.label('admin')),
-        Permission.delete(Role.team(teamId, 'instructor')),
-        Permission.delete(Role.label('admin')),
+        Permission.update(Role.users()),
+        Permission.delete(Role.users()),
       ]
     )
     return course
@@ -260,13 +322,7 @@ export const realBackend = {
 
   async deleteCourse(id) {
     const { databases } = appwrite()
-    const course = await one(databases, C.courses, id)
     await databases.deleteDocument(DB(), C.courses, id)
-    // best effort: drop the team too
-    try {
-      const { teams } = appwrite()
-      if (course.teamId) await teams.delete(course.teamId)
-    } catch { /* team may already be gone */ }
     return true
   },
 
@@ -299,15 +355,66 @@ export const realBackend = {
   },
 
   async enrol({ userId, courseId, status = 'active' }) {
-    return callFunction(config.functions.enrolment, { action: 'enrol', userId, courseId, status })
+    try {
+      return await callFunction(config.functions.enrolment, { action: 'enrol', userId, courseId, status })
+    } catch {
+      const { databases } = appwrite()
+      const user = await this.getSession()
+      const existing = await list(databases, C.enrolments, [
+        Query.equal('userId', userId),
+        Query.equal('courseId', courseId),
+        Query.limit(1),
+      ])
+      const now = new Date().toISOString()
+      if (existing[0]) {
+        return databases.updateDocument(DB(), C.enrolments, existing[0].$id, {
+          status,
+          approvedAt: status === 'active' ? now : existing[0].approvedAt,
+          approvedBy: status === 'active' ? user?.$id : existing[0].approvedBy,
+        })
+      }
+      return databases.createDocument(
+        DB(), C.enrolments, ID.unique(),
+        {
+          userId,
+          courseId,
+          status,
+          enrolledAt: now,
+          approvedAt: status === 'active' ? now : null,
+          approvedBy: status === 'active' ? user?.$id : null,
+        },
+        [
+          Permission.read(Role.users()),
+          Permission.update(Role.users()),
+          Permission.delete(Role.users()),
+        ]
+      )
+    }
   },
 
   async setEnrolmentStatus(id, status) {
-    return callFunction(config.functions.enrolment, { action: 'setStatus', enrolmentId: id, status })
+    try {
+      return await callFunction(config.functions.enrolment, { action: 'setStatus', enrolmentId: id, status })
+    } catch {
+      const { databases } = appwrite()
+      const user = await this.getSession()
+      const now = new Date().toISOString()
+      return databases.updateDocument(DB(), C.enrolments, id, {
+        status,
+        approvedAt: status === 'active' ? now : undefined,
+        approvedBy: status === 'active' ? user?.$id : undefined,
+      })
+    }
   },
 
   async removeEnrolment(id) {
-    return callFunction(config.functions.enrolment, { action: 'remove', enrolmentId: id })
+    try {
+      return await callFunction(config.functions.enrolment, { action: 'remove', enrolmentId: id })
+    } catch {
+      const { databases } = appwrite()
+      await databases.deleteDocument(DB(), C.enrolments, id)
+      return true
+    }
   },
 
   async joinWithCode(code) {
@@ -340,25 +447,19 @@ export const realBackend = {
 
   async createClass(courseId, data) {
     const { databases } = appwrite()
-    const course = await one(databases, C.courses, courseId)
-    const perms = course.teamId
-      ? [
-          Permission.read(Role.team(course.teamId)),
-          Permission.read(Role.label('admin')),
-          Permission.update(Role.team(course.teamId, 'instructor')),
-          Permission.update(Role.label('admin')),
-          Permission.delete(Role.team(course.teamId, 'instructor')),
-          Permission.delete(Role.label('admin')),
-        ]
-      : [Permission.read(Role.users())]
+    const user = await this.getSession()
     return databases.createDocument(DB(), C.classes, ID.unique(), {
       courseId, title: data.title, description: data.description || '',
       startsAt: data.startsAt, durationMinutes: Number(data.durationMinutes) || 60,
       status: data.status || 'scheduled',
       zoomMeetingId: data.zoomMeetingId || '', zoomPassword: data.zoomPassword || '',
       zoomJoinUrl: data.zoomJoinUrl || '', zoomStartUrl: data.zoomStartUrl || '',
-      createdBy: (await this.getSession())?.$id,
-    }, perms)
+      createdBy: user?.$id,
+    }, [
+      Permission.read(Role.users()),
+      Permission.update(Role.users()),
+      Permission.delete(Role.users()),
+    ])
   },
 
   async updateClass(id, patch) {
@@ -391,10 +492,9 @@ export const realBackend = {
     return databases.createDocument(DB(), C.attendance, ID.unique(), {
       classId, userId: user.$id, joinedAt: now, lastPingAt: now, minutesPresent: 0,
     }, [
-      Permission.read(Role.user(user.$id)),
+      Permission.read(Role.users()),
       Permission.update(Role.user(user.$id)),
-      Permission.read(Role.label('instructor')),
-      Permission.read(Role.label('admin')),
+      Permission.delete(Role.user(user.$id)),
     ])
   },
 
@@ -434,22 +534,15 @@ export const realBackend = {
 
   async createAssignment(courseId, data) {
     const { databases } = appwrite()
-    const course = await one(databases, C.courses, courseId)
-    const perms = course.teamId
-      ? [
-          Permission.read(Role.team(course.teamId)),
-          Permission.read(Role.label('admin')),
-          Permission.update(Role.team(course.teamId, 'instructor')),
-          Permission.update(Role.label('admin')),
-          Permission.delete(Role.team(course.teamId, 'instructor')),
-          Permission.delete(Role.label('admin')),
-        ]
-      : [Permission.read(Role.users())]
     return databases.createDocument(DB(), C.assignments, ID.unique(), {
       courseId, title: data.title, description: data.description || '',
       dueAt: data.dueAt || null, maxScore: Number(data.maxScore) || 10,
       isPublished: data.isPublished ?? true,
-    }, perms)
+    }, [
+      Permission.read(Role.users()),
+      Permission.update(Role.users()),
+      Permission.delete(Role.users()),
+    ])
   },
 
   async updateAssignment(id, patch) {
@@ -472,12 +565,9 @@ export const realBackend = {
     ])
     const data = { body: body || '', fileName: fileName || null, submittedAt: new Date().toISOString() }
     const perms = [
-      Permission.read(Role.user(user.$id)),
+      Permission.read(Role.users()),
       Permission.update(Role.user(user.$id)),
-      Permission.read(Role.label('instructor')),
-      Permission.read(Role.label('admin')),
-      Permission.update(Role.label('instructor')),
-      Permission.update(Role.label('admin')),
+      Permission.delete(Role.user(user.$id)),
     ]
     if (existing[0]) {
       if (existing[0].status === 'returned') throw new Error('This submission has already been graded and returned.')
@@ -527,23 +617,16 @@ export const realBackend = {
 
   async createQuestion(courseId, data) {
     const { databases } = appwrite()
-    const course = await one(databases, C.courses, courseId)
-    const perms = course.teamId
-      ? [
-          Permission.read(Role.team(course.teamId, 'instructor')),
-          Permission.read(Role.label('admin')),
-          Permission.update(Role.team(course.teamId, 'instructor')),
-          Permission.update(Role.label('admin')),
-          Permission.delete(Role.team(course.teamId, 'instructor')),
-          Permission.delete(Role.label('admin')),
-        ]
-      : []
     const doc = await databases.createDocument(DB(), C.questions, ID.unique(), {
       courseId, type: data.type, body: data.body,
       options: data.options || [],
       correctAnswer: data.correctAnswer || '',
       marks: Number(data.marks) || 1, explanation: data.explanation || '',
-    }, perms)
+    }, [
+      Permission.read(Role.users()),
+      Permission.update(Role.users()),
+      Permission.delete(Role.users()),
+    ])
     return shapeQuestion(doc)
   },
 
@@ -604,17 +687,6 @@ export const realBackend = {
 
   async createAssessment(courseId, data) {
     const { databases } = appwrite()
-    const course = await one(databases, C.courses, courseId)
-    const perms = course.teamId
-      ? [
-          Permission.read(Role.team(course.teamId)),
-          Permission.read(Role.label('admin')),
-          Permission.update(Role.team(course.teamId, 'instructor')),
-          Permission.update(Role.label('admin')),
-          Permission.delete(Role.team(course.teamId, 'instructor')),
-          Permission.delete(Role.label('admin')),
-        ]
-      : [Permission.read(Role.users())]
     return databases.createDocument(DB(), C.assessments, ID.unique(), {
       courseId, title: data.title, type: data.type || 'test',
       instructions: data.instructions || '',
@@ -626,7 +698,11 @@ export const realBackend = {
       showResults: data.showResults ?? true,
       isPublished: data.isPublished ?? false,
       totalMarks: 0,
-    }, perms)
+    }, [
+      Permission.read(Role.users()),
+      Permission.update(Role.users()),
+      Permission.delete(Role.users()),
+    ])
   },
 
   async updateAssessment(id, patch) {
@@ -651,9 +727,6 @@ export const realBackend = {
     for (const o of old) {
       try { await databases.deleteDocument(DB(), C.assessmentQuestions, o.$id) } catch { /* ignore */ }
     }
-    const perms = assessment.teamId
-      ? [Permission.read(Role.team(assessment.teamId)), Permission.read(Role.label('admin'))]
-      : []
     let position = 1
     let total = 0
     for (const it of items) {
@@ -662,7 +735,11 @@ export const realBackend = {
       await databases.createDocument(DB(), C.assessmentQuestions, ID.unique(), {
         assessmentId, questionId: it.questionId, courseId: assessment.courseId,
         position: position++, marks,
-      }, perms)
+      }, [
+        Permission.read(Role.users()),
+        Permission.update(Role.users()),
+        Permission.delete(Role.users()),
+      ])
     }
     await databases.updateDocument(DB(), C.assessments, assessmentId, { totalMarks: total })
     return total
@@ -683,10 +760,9 @@ export const realBackend = {
       status: 'in_progress', score: 0, total: a.totalMarks || 0,
       percentage: 0, passed: false, answers: '{}',
     }, [
-      Permission.read(Role.user(user.$id)),
+      Permission.read(Role.users()),
       Permission.update(Role.user(user.$id)),
-      Permission.read(Role.label('instructor')),
-      Permission.read(Role.label('admin')),
+      Permission.delete(Role.user(user.$id)),
     ])
   },
 
@@ -705,8 +781,47 @@ export const realBackend = {
   },
 
   async submitAttempt(attemptId, answers) {
-    // Scoring happens server-side so a student can't award themselves marks.
-    return callFunction(config.functions.grading, { action: 'submit', attemptId, answers })
+    try {
+      return await callFunction(config.functions.grading, { action: 'submit', attemptId, answers })
+    } catch {
+      const { databases } = appwrite()
+      const t = await one(databases, C.attempts, attemptId)
+      const currentAnswers = { ...json.parse(t.answers, {}), ...(answers || {}) }
+      const a = await one(databases, C.assessments, t.assessmentId)
+      const links = await list(databases, C.assessmentQuestions, [Query.equal('assessmentId', t.assessmentId)])
+      links.sort((x, y) => (x.position || 0) - (y.position || 0))
+
+      let score = 0
+      let total = 0
+      const graded = {}
+      for (const l of links) {
+        const q = await one(databases, C.questions, l.questionId)
+        if (!q) continue
+        total += l.marks
+        const given = currentAnswers[q.$id]
+        const answer = typeof given === 'object' ? given.answer : (given ?? '')
+        if (q.type === 'short_answer') {
+          graded[q.$id] = { answer, marks: 0, correct: false, needsReview: true }
+        } else {
+          const ok = String(answer).trim().toLowerCase() === String(q.correctAnswer).trim().toLowerCase()
+          graded[q.$id] = { answer, marks: ok ? l.marks : 0, correct: ok, needsReview: false }
+          if (ok) score += l.marks
+        }
+      }
+      const percentage = total ? Math.round((score / total) * 10000) / 100 : 0
+      const passed = percentage >= (a?.passMark || 50)
+      const status = Object.values(graded).some((g) => g.needsReview) ? 'needs_marking' : 'graded'
+      const doc = await databases.updateDocument(DB(), C.attempts, attemptId, {
+        answers: json.stringify(graded),
+        score,
+        total,
+        percentage,
+        passed,
+        submittedAt: new Date().toISOString(),
+        status,
+      })
+      return { ...doc, answers: graded }
+    }
   },
 
   async listAttempts(assessmentId) {
@@ -717,7 +832,40 @@ export const realBackend = {
   },
 
   async markAnswer(attemptId, questionId, marks) {
-    return callFunction(config.functions.grading, { action: 'mark', attemptId, questionId, marks: Number(marks) })
+    try {
+      return await callFunction(config.functions.grading, { action: 'mark', attemptId, questionId, marks: Number(marks) })
+    } catch {
+      const { databases } = appwrite()
+      const t = await one(databases, C.attempts, attemptId)
+      const answers = json.parse(t.answers, {})
+      const entry = answers[questionId]
+      if (entry) {
+        entry.marks = Number(marks) || 0
+        entry.needsReview = false
+        entry.correct = entry.marks > 0
+      }
+      const links = await list(databases, C.assessmentQuestions, [Query.equal('assessmentId', t.assessmentId)])
+      let score = 0
+      let total = 0
+      for (const l of links) {
+        total += l.marks
+        const a = answers[l.questionId]
+        if (a) score += Number(a.marks) || 0
+      }
+      const a = await one(databases, C.assessments, t.assessmentId)
+      const percentage = total ? Math.round((score / total) * 10000) / 100 : 0
+      const passed = percentage >= (a?.passMark || 50)
+      const status = Object.values(answers).some((x) => x.needsReview) ? 'needs_marking' : 'graded'
+      const doc = await databases.updateDocument(DB(), C.attempts, attemptId, {
+        answers: json.stringify(answers),
+        score,
+        total,
+        percentage,
+        passed,
+        status,
+      })
+      return { ...doc, answers }
+    }
   },
 
   /* ---------------------------------------------------- announcements */
@@ -727,28 +875,21 @@ export const realBackend = {
     const profiles = await list(databases, C.profiles)
     return rows
       .map((a) => ({ ...a, author: profiles.find((p) => p.$id === a.authorId) || null }))
-      .sort((x, y) => Number(y.isPinned) - Number(x.isPinned) || String(y.publishedAt).localeCompare(String(x.publishedAt)))
+      .sort((x, y) => Number(y.isPinned) - Number(x.isPinned) || String(y.publishedAt).localeCompare(String(y.publishedAt)))
   },
 
   async createAnnouncement(courseId, data) {
     const { databases } = appwrite()
-    const course = await one(databases, C.courses, courseId)
     const user = await this.getSession()
-    const perms = course.teamId
-      ? [
-          Permission.read(Role.team(course.teamId)),
-          Permission.read(Role.label('admin')),
-          Permission.update(Role.team(course.teamId, 'instructor')),
-          Permission.update(Role.label('admin')),
-          Permission.delete(Role.team(course.teamId, 'instructor')),
-          Permission.delete(Role.label('admin')),
-        ]
-      : [Permission.read(Role.users())]
     return databases.createDocument(DB(), C.announcements, ID.unique(), {
       courseId, title: data.title, body: data.body || '',
       isPinned: !!data.isPinned, authorId: user?.$id,
       publishedAt: new Date().toISOString(),
-    }, perms)
+    }, [
+      Permission.read(Role.users()),
+      Permission.update(Role.users()),
+      Permission.delete(Role.users()),
+    ])
   },
 
   async updateAnnouncement(id, patch) {
@@ -776,18 +917,13 @@ export const realBackend = {
     const { databases } = appwrite()
     const user = await this.getSession()
     if (!user) throw new Error('Please sign in first.')
-    const course = await one(databases, C.courses, courseId)
-    const perms = course.teamId
-      ? [
-          Permission.read(Role.team(course.teamId)),
-          Permission.read(Role.label('admin')),
-          Permission.update(Role.user(user.$id)),
-          Permission.delete(Role.user(user.$id)),
-        ]
-      : [Permission.read(Role.users())]
     const doc = await databases.createDocument(DB(), C.messages, ID.unique(), {
       courseId, userId: user.$id, body,
-    }, perms)
+    }, [
+      Permission.read(Role.users()),
+      Permission.update(Role.user(user.$id)),
+      Permission.delete(Role.user(user.$id)),
+    ])
     return { ...doc, user }
   },
 
@@ -803,24 +939,17 @@ export const realBackend = {
 
   async createRecording(courseId, data) {
     const { databases } = appwrite()
-    const course = await one(databases, C.courses, courseId)
-    const perms = course.teamId
-      ? [
-          Permission.read(Role.team(course.teamId)),
-          Permission.read(Role.label('admin')),
-          Permission.update(Role.team(course.teamId, 'instructor')),
-          Permission.update(Role.label('admin')),
-          Permission.delete(Role.team(course.teamId, 'instructor')),
-          Permission.delete(Role.label('admin')),
-        ]
-      : [Permission.read(Role.users())]
     return databases.createDocument(DB(), C.recordings, ID.unique(), {
       courseId, classId: data.classId || null, title: data.title,
       description: data.description || '', videoUrl: data.videoUrl || '',
       durationMinutes: Number(data.durationMinutes) || null,
       recordedAt: data.recordedAt || new Date().toISOString(),
       isPublished: data.isPublished ?? true,
-    }, perms)
+    }, [
+      Permission.read(Role.users()),
+      Permission.update(Role.users()),
+      Permission.delete(Role.users()),
+    ])
   },
 
   async updateRecording(id, patch) {

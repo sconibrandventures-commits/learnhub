@@ -208,35 +208,181 @@ export const realBackend = {
   },
 
   async createUser({ name, email, password, role }) {
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const cleanName = String(name || '').trim()
+    const targetRole = role || 'student'
+
+    if (!cleanEmail || !cleanName) throw new Error('Name and email are required.')
+    if (!password || password.length < 8) throw new Error('Password must be at least 8 characters.')
+
+    // 1. Try Netlify serverless function first (if deployed with APPWRITE_API_KEY)
     try {
-      return await callFunction(config.functions.users, { action: 'create', name, email, password, role })
+      const res = await fetch('/.netlify/functions/adminUser', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'create', name: cleanName, email: cleanEmail, password, role: targetRole }),
+      })
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}))
+        if (body?.ok && body?.user) return body.user
+      }
     } catch {
-      throw new Error('To create accounts directly from Admin without registration, run `node setup/createAdmin.mjs` in your terminal, or invite students to register on the site.')
+      // Netlify function not available; proceed to next strategy
+    }
+
+    // 2. Try Appwrite Function (if deployed)
+    try {
+      return await callFunction(config.functions.users, { action: 'create', name: cleanName, email: cleanEmail, password, role: targetRole })
+    } catch {
+      // Proceed to direct client fallback
+    }
+
+    // 3. Direct client fallback:
+    // Create the Auth user via Appwrite REST API with credentials: 'omit'
+    // so the admin's active session cookie in the browser is untouched.
+    const baseEndpoint = (config.endpoint || 'https://cloud.appwrite.io/v1').replace(/\/+$/, '')
+    const newUserId = ID.unique()
+
+    let createdId = newUserId
+    const res = await fetch(`${baseEndpoint}/account`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Appwrite-Project': config.projectId,
+      },
+      credentials: 'omit',
+      body: JSON.stringify({
+        userId: newUserId,
+        email: cleanEmail,
+        password: password,
+        name: cleanName,
+      }),
+    })
+
+    const data = await res.json().catch(() => ({}))
+
+    if (!res.ok) {
+      if (res.status === 409 || data?.type === 'user_already_exists' || (data?.message && data.message.includes('already exists'))) {
+        throw new Error(`A user with email "${cleanEmail}" is already registered.`)
+      }
+      throw new Error(data?.message || `Failed to create user account (${res.status}).`)
+    }
+
+    if (data?.$id) {
+      createdId = data.$id
+    }
+
+    // 4. Create the profile document in the database using the admin's database client
+    const { databases } = appwrite()
+    try {
+      await databases.createDocument(
+        DB(),
+        C.profiles,
+        createdId,
+        {
+          userId: createdId,
+          name: cleanName,
+          email: cleanEmail,
+          role: targetRole,
+          isActive: true,
+        },
+        [
+          Permission.read(Role.users()),
+          Permission.update(Role.users()),
+          Permission.delete(Role.users()),
+        ]
+      )
+    } catch (err) {
+      // If profile document already exists, update it
+      try {
+        await databases.updateDocument(DB(), C.profiles, createdId, {
+          name: cleanName,
+          email: cleanEmail,
+          role: targetRole,
+          isActive: true,
+        })
+      } catch {
+        throw new Error(`Account created in Auth, but profile setup failed: ${err.message}`)
+      }
+    }
+
+    return {
+      $id: createdId,
+      name: cleanName,
+      email: cleanEmail,
+      role: targetRole,
+      isActive: true,
+      createdAt: new Date().toISOString(),
     }
   },
 
   async setUserRole(userId, role) {
+    // 1. Try Netlify function
+    try {
+      const res = await fetch('/.netlify/functions/adminUser', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'setRole', userId, role }),
+      })
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}))
+        if (body?.ok) return true
+      }
+    } catch { /* proceed */ }
+
+    // 2. Try Appwrite function
     try {
       return await callFunction(config.functions.users, { action: 'setRole', userId, role })
     } catch {
+      // 3. Direct database update
       const { databases } = appwrite()
       return databases.updateDocument(DB(), C.profiles, userId, { role })
     }
   },
 
   async setUserActive(userId, isActive) {
+    // 1. Try Netlify function
+    try {
+      const res = await fetch('/.netlify/functions/adminUser', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'setActive', userId, isActive }),
+      })
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}))
+        if (body?.ok) return true
+      }
+    } catch { /* proceed */ }
+
+    // 2. Try Appwrite function
     try {
       return await callFunction(config.functions.users, { action: 'setActive', userId, isActive })
     } catch {
+      // 3. Direct database update
       const { databases } = appwrite()
       return databases.updateDocument(DB(), C.profiles, userId, { isActive })
     }
   },
 
   async deleteUser(userId) {
+    // 1. Try Netlify function
+    try {
+      const res = await fetch('/.netlify/functions/adminUser', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', userId }),
+      })
+      if (res.ok) {
+        const body = await res.json().catch(() => ({}))
+        if (body?.ok) return true
+      }
+    } catch { /* proceed */ }
+
+    // 2. Try Appwrite function
     try {
       return await callFunction(config.functions.users, { action: 'delete', userId })
     } catch {
+      // 3. Direct database delete
       const { databases } = appwrite()
       await databases.deleteDocument(DB(), C.profiles, userId)
       return true

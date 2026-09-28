@@ -56,6 +56,45 @@ async function callFunction(functionId, payload) {
   return body
 }
 
+async function sendNotification(type, payload) {
+  try {
+    const origin = typeof window !== 'undefined' ? window.location.origin : ''
+    const res = await fetch(`${origin}/.netlify/functions/notify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, payload }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      console.warn('[LearnHub Notification Warning]:', res.status, data)
+    } else {
+      console.log('[LearnHub Notification Sent]:', type, data)
+    }
+    return data
+  } catch (err) {
+    console.warn('[LearnHub Notification Note]:', err.message)
+    return null
+  }
+}
+
+async function getActiveCourseStudents(databases, courseId) {
+  try {
+    const enrolments = await list(databases, C.enrolments, [
+      Query.equal('courseId', courseId),
+      Query.equal('status', 'active'),
+    ])
+    if (!enrolments.length) return []
+    const userIds = enrolments.map((e) => e.userId)
+    const profiles = await list(databases, C.profiles)
+    return profiles
+      .filter((p) => userIds.includes(p.$id) && p.email)
+      .map((p) => ({ name: p.name, email: p.email }))
+  } catch (err) {
+    console.warn('Could not fetch enrolled students for notification:', err)
+    return []
+  }
+}
+
 /* ------------------------------------------------------------------ api */
 
 export const realBackend = {
@@ -224,7 +263,17 @@ export const realBackend = {
       })
       if (res.ok) {
         const body = await res.json().catch(() => ({}))
-        if (body?.ok && body?.user) return body.user
+        if (body?.ok && body?.user) {
+          const origin = typeof window !== 'undefined' ? window.location.origin : ''
+          await sendNotification('user_created', {
+            name: cleanName,
+            email: cleanEmail,
+            password,
+            role: targetRole,
+            loginUrl: `${origin}/login`,
+          })
+          return body.user
+        }
       }
     } catch {
       // Netlify function not available; proceed to next strategy
@@ -305,6 +354,15 @@ export const realBackend = {
         throw new Error(`Account created in Auth, but profile setup failed: ${err.message}`)
       }
     }
+
+    const origin = typeof window !== 'undefined' ? window.location.origin : ''
+    await sendNotification('user_created', {
+      name: cleanName,
+      email: cleanEmail,
+      password,
+      role: targetRole,
+      loginUrl: `${origin}/login`,
+    })
 
     return {
       $id: createdId,
@@ -501,8 +559,9 @@ export const realBackend = {
   },
 
   async enrol({ userId, courseId, status = 'active' }) {
+    let result
     try {
-      return await callFunction(config.functions.enrolment, { action: 'enrol', userId, courseId, status })
+      result = await callFunction(config.functions.enrolment, { action: 'enrol', userId, courseId, status })
     } catch {
       const { databases } = appwrite()
       const user = await this.getSession()
@@ -513,44 +572,103 @@ export const realBackend = {
       ])
       const now = new Date().toISOString()
       if (existing[0]) {
-        return databases.updateDocument(DB(), C.enrolments, existing[0].$id, {
+        result = await databases.updateDocument(DB(), C.enrolments, existing[0].$id, {
           status,
           approvedAt: status === 'active' ? now : existing[0].approvedAt,
           approvedBy: status === 'active' ? user?.$id : existing[0].approvedBy,
         })
+      } else {
+        result = await databases.createDocument(
+          DB(), C.enrolments, ID.unique(),
+          {
+            userId,
+            courseId,
+            status,
+            enrolledAt: now,
+            approvedAt: status === 'active' ? now : null,
+            approvedBy: status === 'active' ? user?.$id : null,
+          },
+          [
+            Permission.read(Role.users()),
+            Permission.update(Role.users()),
+            Permission.delete(Role.users()),
+          ]
+        )
       }
-      return databases.createDocument(
-        DB(), C.enrolments, ID.unique(),
-        {
-          userId,
-          courseId,
-          status,
-          enrolledAt: now,
-          approvedAt: status === 'active' ? now : null,
-          approvedBy: status === 'active' ? user?.$id : null,
-        },
-        [
-          Permission.read(Role.users()),
-          Permission.update(Role.users()),
-          Permission.delete(Role.users()),
-        ]
-      )
     }
+
+    if (status === 'active') {
+      try {
+        const { databases } = appwrite()
+        const [student, course] = await Promise.all([
+          one(databases, C.profiles, userId).catch(() => null),
+          one(databases, C.courses, courseId).catch(() => null),
+        ])
+        if (student?.email && course) {
+          const origin = typeof window !== 'undefined' ? window.location.origin : ''
+          let instructor = null
+          if (course.instructorId) {
+            instructor = await one(databases, C.profiles, course.instructorId).catch(() => null)
+          }
+          await sendNotification('enrolment_activated', {
+            name: student.name,
+            email: student.email,
+            courseTitle: course.title,
+            courseCode: course.code,
+            instructorName: instructor?.name || 'Course Instructor',
+            courseUrl: `${origin}/courses/${course.slug || courseId}`,
+          })
+        }
+      } catch { /* ignore notification errors */ }
+    }
+
+    return result
   },
 
   async setEnrolmentStatus(id, status) {
+    let result
     try {
-      return await callFunction(config.functions.enrolment, { action: 'setStatus', enrolmentId: id, status })
+      result = await callFunction(config.functions.enrolment, { action: 'setStatus', enrolmentId: id, status })
     } catch {
       const { databases } = appwrite()
       const user = await this.getSession()
       const now = new Date().toISOString()
-      return databases.updateDocument(DB(), C.enrolments, id, {
+      result = await databases.updateDocument(DB(), C.enrolments, id, {
         status,
         approvedAt: status === 'active' ? now : undefined,
         approvedBy: status === 'active' ? user?.$id : undefined,
       })
     }
+
+    if (status === 'active') {
+      try {
+        const { databases } = appwrite()
+        const enrolDoc = await one(databases, C.enrolments, id).catch(() => null)
+        if (enrolDoc) {
+          const [student, course] = await Promise.all([
+            one(databases, C.profiles, enrolDoc.userId).catch(() => null),
+            one(databases, C.courses, enrolDoc.courseId).catch(() => null),
+          ])
+          if (student?.email && course) {
+            const origin = typeof window !== 'undefined' ? window.location.origin : ''
+            let instructor = null
+            if (course.instructorId) {
+              instructor = await one(databases, C.profiles, course.instructorId).catch(() => null)
+            }
+            await sendNotification('enrolment_activated', {
+              name: student.name,
+              email: student.email,
+              courseTitle: course.title,
+              courseCode: course.code,
+              instructorName: instructor?.name || 'Course Instructor',
+              courseUrl: `${origin}/courses/${course.slug || course.$id}`,
+            })
+          }
+        }
+      } catch { /* ignore notification errors */ }
+    }
+
+    return result
   },
 
   async removeEnrolment(id) {
@@ -594,7 +712,7 @@ export const realBackend = {
   async createClass(courseId, data) {
     const { databases } = appwrite()
     const user = await this.getSession()
-    return databases.createDocument(DB(), C.classes, ID.unique(), {
+    const doc = await databases.createDocument(DB(), C.classes, ID.unique(), {
       courseId, title: data.title, description: data.description || '',
       startsAt: data.startsAt, durationMinutes: Number(data.durationMinutes) || 60,
       status: data.status || 'scheduled',
@@ -606,6 +724,28 @@ export const realBackend = {
       Permission.update(Role.users()),
       Permission.delete(Role.users()),
     ])
+
+    // Send email notification to enrolled students
+    try {
+      const [course, students] = await Promise.all([
+        one(databases, C.courses, courseId).catch(() => null),
+        getActiveCourseStudents(databases, courseId),
+      ])
+      if (course && students.length > 0) {
+        const origin = typeof window !== 'undefined' ? window.location.origin : ''
+        await sendNotification('class_scheduled', {
+          courseTitle: course.title,
+          classTitle: data.title,
+          description: data.description || '',
+          startsAt: data.startsAt,
+          durationMinutes: Number(data.durationMinutes) || 60,
+          classUrl: `${origin}/courses/${course.slug || courseId}/classes`,
+          recipients: students,
+        })
+      }
+    } catch { /* non-blocking */ }
+
+    return doc
   },
 
   async updateClass(id, patch) {
@@ -680,7 +820,7 @@ export const realBackend = {
 
   async createAssignment(courseId, data) {
     const { databases } = appwrite()
-    return databases.createDocument(DB(), C.assignments, ID.unique(), {
+    const doc = await databases.createDocument(DB(), C.assignments, ID.unique(), {
       courseId, title: data.title, description: data.description || '',
       dueAt: data.dueAt || null, maxScore: Number(data.maxScore) || 10,
       isPublished: data.isPublished ?? true,
@@ -689,6 +829,29 @@ export const realBackend = {
       Permission.update(Role.users()),
       Permission.delete(Role.users()),
     ])
+
+    if (data.isPublished ?? true) {
+      try {
+        const [course, students] = await Promise.all([
+          one(databases, C.courses, courseId).catch(() => null),
+          getActiveCourseStudents(databases, courseId),
+        ])
+        if (course && students.length > 0) {
+          const origin = typeof window !== 'undefined' ? window.location.origin : ''
+          await sendNotification('assignment', {
+            courseTitle: course.title,
+            assignmentTitle: data.title,
+            description: data.description || '',
+            dueAt: data.dueAt,
+            maxScore: Number(data.maxScore) || 10,
+            assignmentUrl: `${origin}/courses/${course.slug || courseId}/assignments`,
+            recipients: students,
+          })
+        }
+      } catch { /* non-blocking */ }
+    }
+
+    return doc
   },
 
   async updateAssignment(id, patch) {
@@ -745,13 +908,35 @@ export const realBackend = {
   async gradeSubmission(id, { score, feedback, returned }) {
     const { databases } = appwrite()
     const user = await this.getSession()
-    return databases.updateDocument(DB(), C.submissions, id, {
+    const doc = await databases.updateDocument(DB(), C.submissions, id, {
       score: score === '' || score === null ? null : Number(score),
       feedback: feedback || '',
       gradedAt: new Date().toISOString(),
       gradedBy: user?.$id,
       status: returned ? 'returned' : 'graded',
     })
+
+    try {
+      const submission = await one(databases, C.submissions, id)
+      const assignment = await one(databases, C.assignments, submission.assignmentId)
+      const course = await one(databases, C.courses, assignment.courseId)
+      const student = await one(databases, C.profiles, submission.userId)
+      if (student?.email) {
+        const origin = typeof window !== 'undefined' ? window.location.origin : ''
+        await sendNotification('submission_graded', {
+          name: student.name,
+          email: student.email,
+          courseTitle: course?.title || 'Course',
+          assignmentTitle: assignment?.title || 'Assignment',
+          score: score === '' || score === null ? 0 : Number(score),
+          maxScore: assignment?.maxScore || 10,
+          feedback: feedback || '',
+          assignmentUrl: `${origin}/courses/${course?.slug || course?.$id}/assignments`,
+        })
+      }
+    } catch { /* non-blocking */ }
+
+    return doc
   },
 
   /* -------------------------------------------------------- questions */
@@ -833,7 +1018,7 @@ export const realBackend = {
 
   async createAssessment(courseId, data) {
     const { databases } = appwrite()
-    return databases.createDocument(DB(), C.assessments, ID.unique(), {
+    const doc = await databases.createDocument(DB(), C.assessments, ID.unique(), {
       courseId, title: data.title, type: data.type || 'test',
       instructions: data.instructions || '',
       startsAt: data.startsAt || null, endsAt: data.endsAt || null,
@@ -849,6 +1034,29 @@ export const realBackend = {
       Permission.update(Role.users()),
       Permission.delete(Role.users()),
     ])
+
+    if (data.isPublished) {
+      try {
+        const [course, students] = await Promise.all([
+          one(databases, C.courses, courseId).catch(() => null),
+          getActiveCourseStudents(databases, courseId),
+        ])
+        if (course && students.length > 0) {
+          const origin = typeof window !== 'undefined' ? window.location.origin : ''
+          await sendNotification('test_published', {
+            courseTitle: course.title,
+            testTitle: data.title,
+            type: data.type || 'test',
+            durationMinutes: Number(data.durationMinutes) || 30,
+            passMark: Number(data.passMark) || 50,
+            testUrl: `${origin}/courses/${course.slug || courseId}/assessments`,
+            recipients: students,
+          })
+        }
+      } catch { /* non-blocking */ }
+    }
+
+    return doc
   },
 
   async updateAssessment(id, patch) {
@@ -1027,7 +1235,7 @@ export const realBackend = {
   async createAnnouncement(courseId, data) {
     const { databases } = appwrite()
     const user = await this.getSession()
-    return databases.createDocument(DB(), C.announcements, ID.unique(), {
+    const doc = await databases.createDocument(DB(), C.announcements, ID.unique(), {
       courseId, title: data.title, body: data.body || '',
       isPinned: !!data.isPinned, authorId: user?.$id,
       publishedAt: new Date().toISOString(),
@@ -1036,6 +1244,26 @@ export const realBackend = {
       Permission.update(Role.users()),
       Permission.delete(Role.users()),
     ])
+
+    try {
+      const [course, students] = await Promise.all([
+        one(databases, C.courses, courseId).catch(() => null),
+        getActiveCourseStudents(databases, courseId),
+      ])
+      if (course && students.length > 0) {
+        const origin = typeof window !== 'undefined' ? window.location.origin : ''
+        await sendNotification('announcement', {
+          courseTitle: course.title,
+          announcementTitle: data.title,
+          announcementBody: data.body,
+          authorName: user?.name || 'Instructor',
+          courseUrl: `${origin}/courses/${course.slug || courseId}/announcements`,
+          recipients: students,
+        })
+      }
+    } catch { /* non-blocking */ }
+
+    return doc
   },
 
   async updateAnnouncement(id, patch) {

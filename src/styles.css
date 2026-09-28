@@ -1,8 +1,3 @@
-/* ==========================================================================
-   LearnHub — design system
-   No framework, no CDN, no build step for styles. Works offline.
-   ========================================================================== */
-
 :root {
   --brand: #4f46e5;
   --brand-700: #4338ca;
@@ -404,19 +399,46 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* -------------------------------------------------------------- auth */
 
 .auth-wrap {
-  min-height: 100vh; display: grid; place-items: center; padding: 24px;
-  background: linear-gradient(135deg, #312e81, #4f46e5 55%, #7c3aed);
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.78), rgba(30, 27, 75, 0.85)),
+              url('/login-bg.jpg') center/cover no-repeat fixed;
 }
 .auth-card {
-  width: 100%; max-width: 430px; background: var(--surface);
-  border-radius: var(--r-lg); box-shadow: var(--shadow-lg); padding: 30px;
+  width: 100%;
+  max-width: 430px;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: var(--r-lg);
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.35), 0 8px 10px -6px rgba(0, 0, 0, 0.25);
+  padding: 32px;
 }
 .auth-card h1 { font-size: 1.45rem; margin-bottom: 4px; }
 .auth-card .sub { color: var(--muted); font-size: .9rem; margin-bottom: 22px; }
-.auth-brand { display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 22px; color: #fff; }
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+  margin-bottom: 24px;
+  color: #fff;
+  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
 .auth-brand .logo {
-  width: 40px; height: 40px; border-radius: 11px; background: rgba(255,255,255,.2);
-  border: 1px solid rgba(255,255,255,.3); display: grid; place-items: center; font-weight: 800;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.25);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.15);
 }
 .auth-alt { text-align: center; margin-top: 18px; font-size: .88rem; color: var(--muted); }
 .auth-err {

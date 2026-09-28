@@ -118,23 +118,6 @@ export function Login() {
       <div className="auth-alt" style={{ fontSize: '.82rem', color: '#64748b', lineHeight: 1.45 }}>
         Access is restricted to authorized students and staff. Accounts are created and provisioned by your administrator.
       </div>
-
-      {isDemo && (
-        <div className="demo-accounts">
-          <b>Demo accounts — click to fill in (password: password)</b>
-          {DEMO_ACCOUNTS.map((a) => (
-            <div className="row row--between" key={a.email}>
-              <span>
-                <Icon name={a.icon} size={13} /> {a.role}
-              </span>
-              <span>
-                <code>{a.email}</code>
-                <button className="fill" type="button" onClick={() => fill(a.email)}>use</button>
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
     </Shell>
   )
 }

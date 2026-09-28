@@ -135,13 +135,6 @@ export function Login() {
           ))}
         </div>
       )}
-
-      {!isDemo && (
-        <div className="demo-accounts">
-          <b>Connected to Appwrite</b>
-          <span className="tiny">{config.endpoint}</span>
-        </div>
-      )}
     </Shell>
   )
 }

@@ -1,18 +1,17 @@
-import nodemailer from 'nodemailer'
-
 /**
  * Universal Email Notification Service for LearnHub.
  *
- * Supported Email Providers:
- * 1. Resend (Recommended, zero-config free tier: 3,000 emails/mo)
- *    Set: RESEND_API_KEY (and optionally EMAIL_FROM)
+ * Supported Providers:
+ * 1. Resend (Default / Recommended) -> RESEND_API_KEY
+ * 2. SMTP (Gmail, Brevo, SendGrid, Mailgun) -> SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS
  *
- * 2. SMTP (Gmail, Brevo, SendGrid, Mailgun, AWS SES, cPanel)
- *    Set: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS (and optionally EMAIL_FROM)
- *
- * 3. Fallback / Dev Mode
- *    If no email provider is configured, notifications are logged safely to the console.
+ * Built with native fetch for Resend (zero external dependencies).
  */
+
+function cleanEnv(val) {
+  if (!val) return ''
+  return String(val).trim().replace(/^["']|["']$/g, '')
+}
 
 function wrapTemplate({ brandName = 'LearnHub', title, headline, bodyHtml, ctaText, ctaUrl }) {
   return `<!DOCTYPE html>
@@ -61,7 +60,7 @@ function wrapTemplate({ brandName = 'LearnHub', title, headline, bodyHtml, ctaTe
       </div>
     </div>
     <div class="footer">
-      Automated update from ${brandName} · Please do not reply directly to this email.
+      Automated notification from ${brandName} · Please do not reply directly to this email.
     </div>
   </div>
 </body>
@@ -82,16 +81,36 @@ function formatDateSafe(val) {
 }
 
 function buildTemplate(type, payload, recipientName = 'Student') {
-  const brandName = process.env.VITE_APP_NAME || 'LearnHub'
+  const brandName = cleanEnv(process.env.VITE_APP_NAME) || 'LearnHub'
 
   switch (type) {
+    case 'test': {
+      const subject = `Test Email from ${brandName}`
+      const headline = `Email Service Connected Successfully!`
+      const bodyHtml = `
+        <p class="text">Hello <b>${recipientName}</b>,</p>
+        <p class="text">This is a live test email from your <b>${brandName}</b> portal.</p>
+        <div class="box">
+          <div class="box-title">System Status</div>
+          <table class="info-table">
+            <tr><td class="label">Status:</td><td class="value" style="color: #10b981; font-weight: 700;">● Operational</td></tr>
+            <tr><td class="label">Delivery Provider:</td><td class="value">${payload.provider || 'Live'}</td></tr>
+            <tr><td class="label">Time Sent:</td><td class="value">${new Date().toUTCString()}</td></tr>
+          </table>
+        </div>
+        <p class="text">Your email notification service is active and ready to deliver credentials, course updates, and announcements.</p>
+      `
+      const text = `Hello ${recipientName},\n\nYour LearnHub email notification service is operational!\nTime sent: ${new Date().toUTCString()}`
+      return { subject, html: wrapTemplate({ brandName, title: subject, headline, bodyHtml }), text }
+    }
+
     case 'user_created': {
       const { name = recipientName, email, password, role = 'student', loginUrl } = payload
       const roleTitle = role.charAt(0).toUpperCase() + role.slice(1)
       const subject = `Welcome to ${brandName} — Your Login Credentials`
       const headline = `Welcome to ${brandName}, ${name}!`
       const bodyHtml = `
-        <p class="text">Your account has been created with the role of <b>${roleTitle}</b>. You can now log in to access your portal, courses, live interactive classrooms, and assignments.</p>
+        <p class="text">Your account has been created with the role of <b>${roleTitle}</b>. You can now log in to access your portal, enrolled courses, live interactive classrooms, and assignments.</p>
         <div class="box">
           <div class="box-title">Your Login Credentials</div>
           <table class="info-table">
@@ -238,14 +257,70 @@ function buildTemplate(type, payload, recipientName = 'Student') {
 }
 
 async function deliverEmail({ to, subject, html, text }) {
-  const from = process.env.EMAIL_FROM || 'LearnHub <onboarding@resend.dev>'
+  const smtpHost = cleanEnv(process.env.SMTP_HOST)
+  const smtpUser = cleanEnv(process.env.SMTP_USER)
+  const smtpPass = cleanEnv(process.env.SMTP_PASS)
+  const resendKey = cleanEnv(process.env.RESEND_API_KEY)
+  const brandName = cleanEnv(process.env.VITE_APP_NAME) || 'LearnHub'
 
-  // Strategy 1: Resend (Recommended)
-  if (process.env.RESEND_API_KEY) {
+  // Strategy 1: SMTP (Gmail, etc. - Priority when configured)
+  if (smtpHost && smtpUser && smtpPass) {
+    let nodemailer = null
+    try {
+      const mod = await import('nodemailer')
+      nodemailer = mod.default || mod
+    } catch (err) {
+      throw new Error(`nodemailer could not be loaded: ${err.message}`)
+    }
+
+    const isGmail = smtpHost.toLowerCase().includes('gmail')
+    const transportOpts = isGmail
+      ? {
+          service: 'gmail',
+          auth: {
+            user: smtpUser,
+            pass: smtpPass.replace(/\s+/g, ''), // strip spaces from Google App Password
+          },
+        }
+      : {
+          host: smtpHost,
+          port: Number(process.env.SMTP_PORT) || 587,
+          secure: Number(process.env.SMTP_PORT) === 465,
+          auth: {
+            user: smtpUser,
+            pass: smtpPass,
+          },
+        }
+
+    const transporter = nodemailer.createTransport(transportOpts)
+    const fromAddress = cleanEnv(process.env.EMAIL_FROM) || `"${brandName}" <${smtpUser}>`
+
+    try {
+      const info = await transporter.sendMail({
+        from: fromAddress,
+        to,
+        subject,
+        html,
+        text,
+      })
+      console.log(`[LearnHub SMTP Delivered]: To ${to} (Message ID: ${info.messageId})`)
+      return { ok: true, provider: isGmail ? 'gmail' : 'smtp', messageId: info.messageId }
+    } catch (err) {
+      console.error(`[LearnHub SMTP Error]:`, err.message)
+      if (err.message && (err.message.includes('Username and Password not accepted') || err.message.includes('BadCredentials'))) {
+        throw new Error('Gmail authentication failed: Please ensure you are using a 16-character Google App Password (not your normal Gmail account password).')
+      }
+      throw new Error(`SMTP Error: ${err.message}`)
+    }
+  }
+
+  // Strategy 2: Resend
+  if (resendKey) {
+    const from = cleanEnv(process.env.EMAIL_FROM) || 'LearnHub <onboarding@resend.dev>'
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.RESEND_API_KEY.trim()}`,
+        'Authorization': `Bearer ${resendKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -258,30 +333,14 @@ async function deliverEmail({ to, subject, html, text }) {
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) {
-      throw new Error(data?.message || `Resend delivery failed with HTTP ${res.status}`)
+      const errMsg = data?.message || `Resend HTTP ${res.status}`
+      console.error('[Resend Delivery Error]:', { status: res.status, error: errMsg, from, to })
+      if (errMsg.includes('only send testing emails to your own email address')) {
+        throw new Error(`Resend Sandbox Mode: You can only send testing emails to your own Resend account email address until you verify your domain at resend.com/domains.`)
+      }
+      throw new Error(`Resend: ${errMsg}`)
     }
     return { ok: true, provider: 'resend', id: data?.id }
-  }
-
-  // Strategy 2: SMTP (Nodemailer)
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST.trim(),
-      port: Number(process.env.SMTP_PORT) || 587,
-      secure: Number(process.env.SMTP_PORT) === 465,
-      auth: {
-        user: process.env.SMTP_USER.trim(),
-        pass: process.env.SMTP_PASS.trim(),
-      },
-    })
-    const info = await transporter.sendMail({
-      from: process.env.EMAIL_FROM || process.env.SMTP_USER,
-      to,
-      subject,
-      html,
-      text,
-    })
-    return { ok: true, provider: 'smtp', messageId: info.messageId }
   }
 
   // Strategy 3: Development / Fallback Logger
@@ -289,22 +348,82 @@ async function deliverEmail({ to, subject, html, text }) {
   console.log(`[LearnHub Email Simulated]`)
   console.log(`To:      ${to}`)
   console.log(`Subject: ${subject}`)
-  console.log(`Preview: ${text.replace(/\n+/g, ' ').slice(0, 150)}...`)
-  console.log('Notice: Set RESEND_API_KEY or SMTP_HOST in Netlify environment variables to send live emails.')
+  console.log(`Notice: No SMTP_HOST or RESEND_API_KEY found in Netlify environment variables.`)
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
-  return { ok: true, provider: 'simulated' }
+  return {
+    ok: true,
+    provider: 'simulated',
+    note: 'No email provider configured. Please set SMTP_HOST, SMTP_USER, and SMTP_PASS in Netlify.',
+  }
 }
 
 export async function handler(event, context) {
+  // CORS Preflight
   if (event.httpMethod === 'OPTIONS') {
     return {
       statusCode: 200,
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       },
       body: '',
+    }
+  }
+
+  const resendKey = cleanEnv(process.env.RESEND_API_KEY)
+  const smtpHost = cleanEnv(process.env.SMTP_HOST)
+  const smtpUser = cleanEnv(process.env.SMTP_USER)
+  const smtpPass = cleanEnv(process.env.SMTP_PASS)
+  const hasSmtp = Boolean(smtpHost && smtpUser && smtpPass)
+  const isGmail = smtpHost.toLowerCase().includes('gmail')
+  const brandName = cleanEnv(process.env.VITE_APP_NAME) || 'LearnHub'
+
+  // GET Request: Diagnostic & Status Check
+  if (event.httpMethod === 'GET') {
+    const q = event.queryStringParameters || {}
+    const testTo = q.test || q.to
+
+    const provider = hasSmtp ? (isGmail ? 'Gmail SMTP' : 'Custom SMTP') : resendKey ? 'Resend' : 'Simulated (no keys configured)'
+    const emailFrom = cleanEnv(process.env.EMAIL_FROM) || (smtpUser ? `"${brandName}" <${smtpUser}>` : 'LearnHub <onboarding@resend.dev>')
+
+    const diagnostic = {
+      status: 'online',
+      provider,
+      hasSmtp,
+      smtpHost: smtpHost || null,
+      smtpUser: smtpUser ? `${smtpUser.slice(0, 3)}...${smtpUser.slice(smtpUser.indexOf('@'))}` : null,
+      hasResendApiKey: Boolean(resendKey),
+      emailFrom,
+      notice: hasSmtp
+        ? `Ready for live delivery via ${isGmail ? 'Gmail' : smtpHost}. Emails will be sent to ANY address.`
+        : resendKey
+        ? 'Configured with Resend.'
+        : 'No SMTP or Resend credentials detected. Emails are in simulation mode.',
+    }
+
+    if (testTo) {
+      try {
+        const { subject, html, text } = buildTemplate('test', { provider: diagnostic.provider }, 'Administrator')
+        const delivery = await deliverEmail({ to: testTo, subject, html, text })
+        return {
+          statusCode: 200,
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({ ok: true, sent: 1, recipient: testTo, delivery, diagnostic }),
+        }
+      } catch (err) {
+        return {
+          statusCode: 400,
+          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+          body: JSON.stringify({ ok: false, recipient: testTo, error: err.message, diagnostic }),
+        }
+      }
+    }
+
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify(diagnostic),
     }
   }
 
@@ -316,7 +435,29 @@ export async function handler(event, context) {
   try {
     body = JSON.parse(event.body || '{}')
   } catch {
-    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON' }) }
+    return { statusCode: 400, body: JSON.stringify({ error: 'Invalid JSON payload' }) }
+  }
+
+  // Handle action='test'
+  if (body.action === 'test' || body.type === 'test') {
+    const to = body.email || body.payload?.email
+    if (!to) return { statusCode: 400, body: JSON.stringify({ error: 'Email address is required for test' }) }
+    try {
+      const activeProvider = hasSmtp ? (isGmail ? 'Gmail' : 'SMTP') : resendKey ? 'Resend' : 'Simulated'
+      const { subject, html, text } = buildTemplate('test', { provider: activeProvider }, body.name || 'User')
+      const delivery = await deliverEmail({ to, subject, html, text })
+      return {
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({ ok: true, recipient: to, delivery }),
+      }
+    } catch (err) {
+      return {
+        statusCode: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+        body: JSON.stringify({ ok: false, recipient: to, error: err.message }),
+      }
+    }
   }
 
   const { type, payload } = body
@@ -346,17 +487,23 @@ export async function handler(event, context) {
 
     try {
       const res = await deliverEmail({ to: emailAddr, subject, html, text })
-      results.push({ email: emailAddr, status: 'sent', provider: res.provider })
+      results.push({ email: emailAddr, status: 'sent', provider: res.provider, note: res.note })
     } catch (err) {
       console.error(`Failed to send email to ${emailAddr}:`, err.message)
       results.push({ email: emailAddr, status: 'error', error: err.message })
     }
   }
 
+  const hasErrors = results.some((r) => r.status === 'error')
   return {
-    statusCode: 200,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ok: true, sent: results.filter((r) => r.status === 'sent').length, details: results }),
+    statusCode: hasErrors ? 400 : 200,
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    body: JSON.stringify({
+      ok: !hasErrors,
+      sent: results.filter((r) => r.status === 'sent').length,
+      details: results,
+      error: hasErrors ? results.find((r) => r.status === 'error')?.error : undefined,
+    }),
   }
 }
 
@@ -367,21 +514,27 @@ export default async (req) => {
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Headers': 'Content-Type',
-        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       },
     })
   }
 
-  let body = {}
-  try {
-    body = await req.json()
-  } catch {
-    body = {}
+  const url = new URL(req.url)
+  const queryStringParameters = Object.fromEntries(url.searchParams.entries())
+
+  let body = ''
+  if (req.method === 'POST') {
+    try {
+      body = await req.text()
+    } catch {
+      body = ''
+    }
   }
 
   const fakeEvent = {
     httpMethod: req.method,
-    body: JSON.stringify(body),
+    queryStringParameters,
+    body,
   }
 
   const result = await handler(fakeEvent, {})

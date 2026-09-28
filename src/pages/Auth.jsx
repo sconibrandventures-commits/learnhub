@@ -38,6 +38,7 @@ export function Login() {
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -73,16 +74,49 @@ export function Login() {
         </div>
         <div className="field">
           <label htmlFor="password">Password</label>
-          <input id="password" type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-            placeholder="••••••••" required autoComplete="current-password" />
+          <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+            <input
+              id="password"
+              type={showPassword ? 'text' : 'password'}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="••••••••"
+              required
+              autoComplete="current-password"
+              style={{ width: '100%', paddingRight: '42px' }}
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword((prev) => !prev)}
+              title={showPassword ? 'Hide password' : 'Show password'}
+              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              style={{
+                position: 'absolute',
+                right: '8px',
+                top: '50%',
+                transform: 'translateY(-50%)',
+                background: 'transparent',
+                border: 'none',
+                padding: '6px',
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: '#64748b',
+                borderRadius: '4px',
+              }}
+            >
+              <Icon name={showPassword ? 'eyeOff' : 'eye'} size={17} />
+            </button>
+          </div>
         </div>
         <button type="submit" className="btn btn--primary btn--block btn--lg" disabled={busy}>
           {busy ? 'Signing in…' : 'Sign in'}
         </button>
       </form>
 
-      <div className="auth-alt">
-        New here? <Link to="/register">Create an account</Link>
+      <div className="auth-alt" style={{ fontSize: '.82rem', color: '#64748b', lineHeight: 1.45 }}>
+        Access is restricted to authorized students and staff. Accounts are created and provisioned by your administrator.
       </div>
 
       {isDemo && (

@@ -74,7 +74,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<GuestOnly><Login /></GuestOnly>} />
-      <Route path="/register" element={<GuestOnly><Register /></GuestOnly>} />
+      <Route path="/register" element={<Navigate to="/login" replace />} />
 
       {/* Student area */}
       <Route path="/student" element={<RequireAuth><RequireRole roles={['student']}><MyCourses /></RequireRole></RequireAuth>} />

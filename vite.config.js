@@ -3,8 +3,8 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  // Relative base so the built site can be dropped into ANY folder or host.
-  base: './',
+  // Absolute base so client-side routes like /admin/users reload correctly.
+  base: '/',
   server: {
     host: '0.0.0.0',
     port: 5173,

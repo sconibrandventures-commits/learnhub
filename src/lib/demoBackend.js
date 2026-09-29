@@ -517,7 +517,7 @@ export const demoBackend = {
     const course = {
       $id: uid('c'), teamId: `team_${Math.random().toString(36).slice(2, 8)}`,
       title: data.title, slug: slugify(data.title), code: (data.code || '').toUpperCase(),
-      description: data.description || '', instructorId: me()?.$id || data.instructorId,
+      description: data.description || '', instructorId: data.instructorId || me()?.$id,
       category: data.category || '', level: data.level || 'beginner',
       status: data.status || 'draft', passMark: data.passMark ?? 50,
       enrollmentOpen: data.enrollmentOpen ?? true,

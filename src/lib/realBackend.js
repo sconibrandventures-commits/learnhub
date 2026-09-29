@@ -502,7 +502,7 @@ export const realBackend = {
       DB(), C.courses, ID.unique(),
       {
         title: data.title, slug, code: (data.code || '').toUpperCase(),
-        description: data.description || '', instructorId: user?.$id,
+        description: data.description || '', instructorId: data.instructorId || user?.$id,
         teamId, category: data.category || '', level: data.level || 'beginner',
         status: data.status || 'draft', passMark: Number(data.passMark) || 50,
         enrollmentOpen: data.enrollmentOpen ?? true,

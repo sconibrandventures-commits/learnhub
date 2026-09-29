@@ -10,7 +10,7 @@ import { slugify } from '../../lib/helpers'
 
 const BLANK = {
   title: '', code: '', description: '', category: '', level: 'beginner',
-  status: 'published', passMark: 50, enrollmentOpen: true,
+  status: 'published', passMark: 50, enrollmentOpen: true, instructorId: '',
 }
 
 export default function InstructorCourses() {
@@ -22,7 +22,11 @@ export default function InstructorCourses() {
   const [busy, setBusy] = useState(false)
 
   const { data, loading, reload } = useAsync(async () => {
-    const courses = await backend.listCourses()
+    const [courses, users] = await Promise.all([
+      backend.listCourses(),
+      isAdmin ? backend.listUsers() : Promise.resolve([]),
+    ])
+    const instructors = users.filter((u) => u.role === 'instructor' || u.role === 'admin')
     const mine = isAdmin ? courses : courses.filter((c) => c.instructorId === user.$id)
     const rows = await Promise.all(
       mine.map(async (c) => {
@@ -33,14 +37,14 @@ export default function InstructorCourses() {
         return { course: c, students: enrolments.filter((e) => e.status === 'active').length, classes: classes.length }
       })
     )
-    return rows
+    return { rows, instructors }
   }, [user.$id, isAdmin])
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value }))
 
   function openCreate() {
     setEditing(null)
-    setForm(BLANK)
+    setForm({ ...BLANK, instructorId: user?.$id || '' })
     setOpen(true)
   }
 
@@ -51,6 +55,7 @@ export default function InstructorCourses() {
       category: course.category || '', level: course.level || 'beginner',
       status: course.status || 'draft', passMark: course.passMark ?? 50,
       enrollmentOpen: course.enrollmentOpen ?? true,
+      instructorId: course.instructorId || '',
     })
     setOpen(true)
   }
@@ -60,11 +65,13 @@ export default function InstructorCourses() {
     if (!form.title.trim()) return toast.error('Give the course a title.')
     setBusy(true)
     try {
+      const payload = { ...form, passMark: Number(form.passMark) }
+      if (!isAdmin) delete payload.instructorId
       if (editing) {
-        await backend.updateCourse(editing.$id, { ...form, passMark: Number(form.passMark) })
+        await backend.updateCourse(editing.$id, payload)
         toast.success('Course updated.')
       } else {
-        await backend.createCourse({ ...form, passMark: Number(form.passMark) })
+        await backend.createCourse(payload)
         toast.success('Course created. Add classes and content from the course page.')
       }
       setOpen(false)
@@ -88,13 +95,15 @@ export default function InstructorCourses() {
 
   if (loading) return <Layout title="My courses"><Spinner /></Layout>
 
+  const { rows = [], instructors = [] } = data || {}
+
   return (
     <Layout title="My courses">
       <PageHead title="My courses" subtitle="Create courses, then schedule classes and add content.">
         <button className="btn btn--primary" onClick={openCreate}><Icon name="plus" size={15} /> New course</button>
       </PageHead>
 
-      {(data || []).length === 0 ? (
+      {rows.length === 0 ? (
         <div className="card">
           <Empty icon="book" title="No courses yet"
             action={<button className="btn btn--primary" onClick={openCreate}>Create your first course</button>}>
@@ -103,7 +112,7 @@ export default function InstructorCourses() {
         </div>
       ) : (
         <div className="grid grid--3">
-          {(data || []).map(({ course, students, classes }) => (
+          {rows.map(({ course, students, classes }) => (
             <div className="course-card" key={course.$id}>
               <div className="course-card__top" style={course.status === 'draft' ? { background: 'var(--line-2)' } : undefined} />
               <div className="course-card__body">
@@ -175,6 +184,21 @@ export default function InstructorCourses() {
               <textarea id="description" value={form.description} onChange={set('description')}
                 placeholder="What will students learn?" style={{ minHeight: 90 }} />
             </div>
+
+            {isAdmin && (
+              <div className="field">
+                <label htmlFor="instructorId">Assigned instructor</label>
+                <select id="instructorId" value={form.instructorId || ''} onChange={set('instructorId')}>
+                  <option value="">— Unassigned —</option>
+                  {instructors.map((ins) => (
+                    <option key={ins.$id} value={ins.$id}>
+                      {ins.name} ({ins.role})
+                    </option>
+                  ))}
+                </select>
+                <div className="hint">This instructor will have teaching and management permissions for this course.</div>
+              </div>
+            )}
 
             <div className="field-row">
               <div className="field">

@@ -6,6 +6,7 @@ import { useAsync } from '../../lib/useAsync'
 import backend from '../../lib/backend'
 import { Icon, Spinner, Badge, Modal, PageHead, RoleBadge, Avatar, ConfirmButton } from '../../components/ui'
 import { formatDate } from '../../lib/helpers'
+import BulkUserModal from './BulkUserModal'
 
 const BLANK = { name: '', email: '', password: '', role: 'student' }
 
@@ -15,6 +16,7 @@ export default function AdminUsers() {
   const [query, setQuery] = useState('')
   const [roleFilter, setRoleFilter] = useState('all')
   const [open, setOpen] = useState(false)
+  const [bulkOpen, setBulkOpen] = useState(false)
   const [form, setForm] = useState(BLANK)
   const [busy, setBusy] = useState(false)
 
@@ -65,7 +67,14 @@ export default function AdminUsers() {
   return (
     <Layout title="Users">
       <PageHead title="Users" subtitle="Create accounts and control who can do what.">
-        <button className="btn btn--primary" onClick={() => setOpen(true)}><Icon name="plus" size={15} /> Add user</button>
+        <div className="row" style={{ gap: 8 }}>
+          <button className="btn btn--outline" onClick={() => setBulkOpen(true)}>
+            <Icon name="upload" size={15} /> Bulk import users
+          </button>
+          <button className="btn btn--primary" onClick={() => setOpen(true)}>
+            <Icon name="plus" size={15} /> Add user
+          </button>
+        </div>
       </PageHead>
 
       <div className="card mb-3">
@@ -170,6 +179,16 @@ export default function AdminUsers() {
             </div>
           </form>
         </Modal>
+      )}
+
+      {bulkOpen && (
+        <BulkUserModal
+          onClose={() => setBulkOpen(false)}
+          onImportComplete={() => {
+            reload()
+            toast.success('User list updated.')
+          }}
+        />
       )}
     </Layout>
   )

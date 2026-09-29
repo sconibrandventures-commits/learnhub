@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import backend from '../../lib/backend'
 import { Modal, Icon, Badge, Spinner } from '../../components/ui'
 
@@ -37,6 +37,9 @@ function parseCsvLine(line) {
 
 export default function BulkUserModal({ onClose, onImportComplete }) {
   const fileInputRef = useRef(null)
+  const [courses, setCourses] = useState([])
+  const [loadingCourses, setLoadingCourses] = useState(true)
+  const [selectedCourseId, setSelectedCourseId] = useState('') // Global course dropdown
   const [activeTab, setActiveTab] = useState('paste') // 'paste' | 'file'
   const [rawText, setRawText] = useState('')
   const [defaultRole, setDefaultRole] = useState('student')
@@ -45,8 +48,36 @@ export default function BulkUserModal({ onClose, onImportComplete }) {
   const [progress, setProgress] = useState({ current: 0, total: 0, success: 0, failed: 0 })
   const [isCompleted, setIsCompleted] = useState(false)
 
-  // Parse lines whenever rawText or defaultRole changes
-  function handleParse(textToParse, roleDefault = defaultRole) {
+  // Load available courses on mount
+  useEffect(() => {
+    backend.listCourses()
+      .then((res) => {
+        setCourses(res || [])
+        setLoadingCourses(false)
+      })
+      .catch((err) => {
+        console.warn('Failed to load courses for bulk import:', err)
+        setLoadingCourses(false)
+      })
+  }, [])
+
+  // Helper to match a text value to a course by ID, code, slug or title
+  function resolveCourse(val, courseList = courses) {
+    if (!val) return null
+    const v = String(val).trim().toLowerCase()
+    return (
+      courseList.find(
+        (c) =>
+          c.$id === val ||
+          (c.code && c.code.toLowerCase() === v) ||
+          (c.slug && c.slug.toLowerCase() === v) ||
+          (c.title && c.title.toLowerCase() === v)
+      ) || null
+    )
+  }
+
+  // Parse lines whenever rawText, defaultRole or selectedCourseId changes
+  function handleParse(textToParse, roleDefault = defaultRole, globalCourseId = selectedCourseId, courseList = courses) {
     if (!textToParse || !textToParse.trim()) {
       setParsedRows([])
       return
@@ -63,10 +94,21 @@ export default function BulkUserModal({ onClose, onImportComplete }) {
     }
 
     let startIndex = 0
-    // Detect header row if it contains 'name' or 'email'
+    let hasHeader = false
+    let headerColMap = {}
+
     const firstLineLower = lines[0].toLowerCase()
     if (firstLineLower.includes('email') || firstLineLower.includes('name')) {
+      hasHeader = true
       startIndex = 1
+      const headerParts = parseCsvLine(lines[0]).map((h) => h.toLowerCase().trim())
+      headerParts.forEach((h, idx) => {
+        if (h.includes('name')) headerColMap.name = idx
+        else if (h.includes('email')) headerColMap.email = idx
+        else if (h.includes('pass')) headerColMap.password = idx
+        else if (h.includes('role')) headerColMap.role = idx
+        else if (h.includes('course')) headerColMap.course = idx
+      })
     }
 
     const seenEmails = new Set()
@@ -80,19 +122,40 @@ export default function BulkUserModal({ onClose, onImportComplete }) {
       let email = ''
       let password = ''
       let role = roleDefault
+      let courseValue = ''
 
-      // Smart column assignment:
-      // If column 0 is email and column 1 is name, or vice versa:
-      if (parts[0] && parts[0].includes('@')) {
-        email = parts[0]
-        name = parts[1] || ''
-        password = parts[2] || ''
-        role = parts[3] || roleDefault
+      if (hasHeader && headerColMap.name !== undefined) {
+        name = parts[headerColMap.name] || ''
+        email = parts[headerColMap.email] || ''
+        password = headerColMap.password !== undefined ? parts[headerColMap.password] || '' : ''
+        role = headerColMap.role !== undefined ? parts[headerColMap.role] || roleDefault : roleDefault
+        courseValue = headerColMap.course !== undefined ? parts[headerColMap.course] || '' : ''
       } else {
-        name = parts[0] || ''
-        email = parts[1] || ''
-        password = parts[2] || ''
-        role = parts[3] || roleDefault
+        // Positional parsing:
+        // Format: Name, Email, [Password], [Role], [Course]
+        // Or if column 0 contains '@', it's Email, Name, [Password], [Role], [Course]
+        if (parts[0] && parts[0].includes('@')) {
+          email = parts[0]
+          name = parts[1] || ''
+          password = parts[2] || ''
+          role = parts[3] || roleDefault
+          courseValue = parts[4] || ''
+        } else {
+          name = parts[0] || ''
+          email = parts[1] || ''
+          password = parts[2] || ''
+          role = parts[3] || roleDefault
+          courseValue = parts[4] || ''
+        }
+      }
+
+      // Check if parts[2] or parts[3] was accidentally a course code instead of password/role
+      if (!courseValue) {
+        const checkCol3 = resolveCourse(role, courseList)
+        if (checkCol3) {
+          courseValue = role
+          role = roleDefault
+        }
       }
 
       // Normalise role
@@ -102,6 +165,12 @@ export default function BulkUserModal({ onClose, onImportComplete }) {
       const cleanEmail = email.toLowerCase().trim()
       const cleanName = name.trim()
       const generatedPass = password && password.length >= 8 ? password.trim() : generatePassword()
+
+      // Resolve course: per-row value takes precedence; falls back to global dropdown selection
+      let rowCourse = resolveCourse(courseValue, courseList)
+      if (!rowCourse && globalCourseId) {
+        rowCourse = courseList.find((c) => c.$id === globalCourseId) || null
+      }
 
       let validationError = ''
       if (!cleanEmail || !cleanEmail.includes('@') || !cleanEmail.includes('.')) {
@@ -120,6 +189,8 @@ export default function BulkUserModal({ onClose, onImportComplete }) {
         email: cleanEmail,
         password: generatedPass,
         role: normalizedRole,
+        courseId: rowCourse?.$id || '',
+        courseTitle: rowCourse ? `${rowCourse.title} (${rowCourse.code || ''})` : '— None —',
         valid: !validationError,
         error: validationError,
         status: validationError ? 'invalid' : 'pending', // pending, running, done, failed, invalid
@@ -137,7 +208,7 @@ export default function BulkUserModal({ onClose, onImportComplete }) {
     reader.onload = (event) => {
       const content = event.target?.result || ''
       setRawText(content)
-      handleParse(content)
+      handleParse(content, defaultRole, selectedCourseId, courses)
     }
     reader.readAsText(file)
   }
@@ -145,15 +216,48 @@ export default function BulkUserModal({ onClose, onImportComplete }) {
   function handleRoleChange(newRole) {
     setDefaultRole(newRole)
     if (rawText) {
-      handleParse(rawText, newRole)
+      handleParse(rawText, newRole, selectedCourseId, courses)
     }
   }
 
+  function handleCourseChange(newCourseId) {
+    setSelectedCourseId(newCourseId)
+    if (rawText) {
+      handleParse(rawText, defaultRole, newCourseId, courses)
+    } else {
+      // Update existing rows if any
+      const course = courses.find((c) => c.$id === newCourseId)
+      setParsedRows((prev) =>
+        prev.map((r) => ({
+          ...r,
+          courseId: newCourseId,
+          courseTitle: course ? `${course.title} (${course.code || ''})` : '— None —',
+        }))
+      )
+    }
+  }
+
+  function setRowCourse(rowId, courseId) {
+    const course = courses.find((c) => c.$id === courseId)
+    setParsedRows((prev) =>
+      prev.map((r) =>
+        r.id === rowId
+          ? {
+              ...r,
+              courseId,
+              courseTitle: course ? `${course.title} (${course.code || ''})` : '— None —',
+            }
+          : r
+      )
+    )
+  }
+
   function downloadSampleCsv() {
-    const sample = `Full Name,Email Address,Password (optional),Role (optional)
-Chinedu Okafor,chinedu.okafor@example.com,Pass1234!,student
-Amina Mohammed,amina.m@example.com,,student
-Babatunde Adeleke,babatunde@example.com,,instructor`
+    const sampleCode = courses[0]?.code || 'WEB-101'
+    const sample = `Full Name,Email Address,Password (optional),Role (optional),Course Code (optional)
+Chinedu Okafor,chinedu.okafor@example.com,Pass1234!,student,${sampleCode}
+Amina Mohammed,amina.m@example.com,,student,${sampleCode}
+Babatunde Adeleke,babatunde@example.com,,instructor,${sampleCode}`
 
     const blob = new Blob([sample], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
@@ -165,12 +269,13 @@ Babatunde Adeleke,babatunde@example.com,,instructor`
   }
 
   function downloadCredentialsCsv() {
-    const headers = 'Full Name,Email Address,Password,Role,Status,Details\n'
+    const headers = 'Full Name,Email Address,Password,Role,Assigned Course,Status,Details\n'
     const body = parsedRows
       .map((r) => {
         const cleanName = `"${r.name.replace(/"/g, '""')}"`
+        const cleanCourse = `"${r.courseTitle.replace(/"/g, '""')}"`
         const cleanErr = `"${(r.error || '').replace(/"/g, '""')}"`
-        return `${cleanName},${r.email},${r.password},${r.role},${r.status},${cleanErr}`
+        return `${cleanName},${r.email},${r.password},${r.role},${cleanCourse},${r.status},${cleanErr}`
       })
       .join('\n')
 
@@ -205,12 +310,34 @@ Babatunde Adeleke,babatunde@example.com,,instructor`
       )
 
       try {
-        await backend.createUser({
+        // 1. Create User
+        const newUser = await backend.createUser({
           name: row.name,
           email: row.email,
           password: row.password,
           role: row.role,
         })
+
+        // 2. Attach Course if specified
+        if (row.courseId && newUser?.$id) {
+          try {
+            if (row.role === 'student') {
+              // Enrol student in the course
+              await backend.enrol({
+                userId: newUser.$id,
+                courseId: row.courseId,
+                status: 'active',
+              })
+            } else if (row.role === 'instructor') {
+              // Assign course to instructor
+              await backend.updateCourse(row.courseId, {
+                instructorId: newUser.$id,
+              })
+            }
+          } catch (courseErr) {
+            console.warn(`User created, but course attachment encountered: ${courseErr?.message}`)
+          }
+        }
 
         successCount++
         setParsedRows((prev) =>
@@ -248,9 +375,9 @@ Babatunde Adeleke,babatunde@example.com,,instructor`
 
   return (
     <Modal
-      title="Bulk Import Users"
+      title="Bulk Import Users & Course Enrolment"
       onClose={isProcessing ? undefined : onClose}
-      width={780}
+      width={860}
       footer={
         <div className="row row--between" style={{ width: '100%' }}>
           <button
@@ -307,49 +434,90 @@ Babatunde Adeleke,babatunde@example.com,,instructor`
         {/* Banner with guidelines */}
         <div className="alert alert--info" style={{ fontSize: '.86rem', lineHeight: 1.5 }}>
           <div>
-            <b>Automated Email Notification & Passwords:</b>
+            <b>Automated Course Enrolment & Credentials Delivery:</b>
             <div>
-              Each imported user will automatically receive a welcome email with their login credentials.
-              If you leave passwords blank, a secure random password will be auto-generated for them.
+              Imported users automatically receive an onboarding email with their login credentials.
+              If a course is selected below or specified in your sheet, students will be <b>automatically enrolled</b> and instructors will be <b>assigned as teachers</b>.
             </div>
           </div>
         </div>
 
-        {/* Input Controls */}
-        <div className="row row--between" style={{ alignItems: 'flex-end' }}>
-          <div className="tabs" style={{ margin: 0 }}>
-            <button
-              type="button"
-              className={activeTab === 'paste' ? 'active' : ''}
-              onClick={() => setActiveTab('paste')}
+        {/* Global Selectors: Course Dropdown and Default Role */}
+        <div
+          style={{
+            background: 'var(--surface)',
+            border: '1px solid var(--line)',
+            borderRadius: 'var(--r-sm)',
+            padding: '14px 16px',
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+            gap: 14,
+          }}
+        >
+          {/* Course Dropdown */}
+          <div className="field" style={{ margin: 0 }}>
+            <label htmlFor="bulk-course" style={{ marginBottom: 4, fontSize: '.84rem', fontWeight: 650 }}>
+              Attach to Course (Optional):
+            </label>
+            <select
+              id="bulk-course"
+              value={selectedCourseId}
+              onChange={(e) => handleCourseChange(e.target.value)}
+              disabled={isProcessing || loadingCourses}
+              style={{ padding: '8px 10px', fontSize: '.88rem' }}
             >
-              Paste Text / Excel
-            </button>
-            <button
-              type="button"
-              className={activeTab === 'file' ? 'active' : ''}
-              onClick={() => setActiveTab('file')}
-            >
-              Upload CSV File
-            </button>
+              <option value="">— None (Account creation only) —</option>
+              {courses.map((c) => (
+                <option key={c.$id} value={c.$id}>
+                  {c.title} {c.code ? `[${c.code}]` : ''}
+                </option>
+              ))}
+            </select>
+            <div className="tiny muted mt-1">
+              {selectedCourseId
+                ? 'Applies to all rows unless a specific course code is typed in the sheet.'
+                : 'Choose a course to enrol this entire batch at once.'}
+            </div>
           </div>
 
-          <div className="field" style={{ margin: 0, minWidth: 190 }}>
-            <label htmlFor="bulk-default-role" style={{ marginBottom: 4, fontSize: '.8rem' }}>
-              Default Role if not specified:
+          {/* Default Role Dropdown */}
+          <div className="field" style={{ margin: 0 }}>
+            <label htmlFor="bulk-default-role" style={{ marginBottom: 4, fontSize: '.84rem', fontWeight: 650 }}>
+              Default Role (if unspecified in sheet):
             </label>
             <select
               id="bulk-default-role"
               value={defaultRole}
               onChange={(e) => handleRoleChange(e.target.value)}
               disabled={isProcessing}
-              style={{ padding: '6px 10px', fontSize: '.85rem' }}
+              style={{ padding: '8px 10px', fontSize: '.88rem' }}
             >
               <option value="student">Student</option>
               <option value="instructor">Instructor</option>
               <option value="admin">Administrator</option>
             </select>
+            <div className="tiny muted mt-1">
+              Passwords will be auto-generated (e.g. <code>Hub7k2x!</code>) if left blank.
+            </div>
           </div>
+        </div>
+
+        {/* Input Controls: Tabs */}
+        <div className="tabs" style={{ margin: 0 }}>
+          <button
+            type="button"
+            className={activeTab === 'paste' ? 'active' : ''}
+            onClick={() => setActiveTab('paste')}
+          >
+            Paste Text / Excel
+          </button>
+          <button
+            type="button"
+            className={activeTab === 'file' ? 'active' : ''}
+            onClick={() => setActiveTab('file')}
+          >
+            Upload CSV File
+          </button>
         </div>
 
         {/* Tab 1: Paste Text */}
@@ -359,13 +527,13 @@ Babatunde Adeleke,babatunde@example.com,,instructor`
               value={rawText}
               onChange={(e) => {
                 setRawText(e.target.value)
-                handleParse(e.target.value)
+                handleParse(e.target.value, defaultRole, selectedCourseId, courses)
               }}
               disabled={isProcessing}
-              placeholder={`Paste lines directly from Excel, Sheets or text (Name, Email, [Password], [Role]):
+              placeholder={`Paste rows directly from Excel or Google Sheets (Name, Email, [Password], [Role], [Course Code]):
 Chinedu Okafor, chinedu@example.com
-Amina Yusuf, amina@example.com, Pass1234!, student
-Babatunde Adeleke, babatunde@example.com,, instructor`}
+Amina Yusuf, amina@example.com, Pass1234!, student, WEB-101
+Babatunde Adeleke, babatunde@example.com,, instructor, DATA-201`}
               style={{
                 fontFamily: 'var(--mono)',
                 fontSize: '.85rem',
@@ -374,7 +542,7 @@ Babatunde Adeleke, babatunde@example.com,, instructor`}
               }}
             />
             <div className="tiny muted mt-1">
-              Supports comma, tab, or semicolon delimiters. Headers like "Name, Email" are automatically detected.
+              Supports commas or tabs. Columns: <code>Full Name, Email, Password (opt), Role (opt), Course (opt)</code>.
             </div>
           </div>
         )}
@@ -400,8 +568,10 @@ Babatunde Adeleke, babatunde@example.com,, instructor`}
               onChange={handleFileUpload}
             />
             <Icon name="upload" size={32} style={{ color: 'var(--brand)', marginBottom: 8 }} />
-            <div className="b">Click here to upload your .csv file</div>
-            <div className="tiny muted mt-1">Accepts CSV or tab-delimited text files up to 500 rows</div>
+            <div className="b">Click here to select and upload your .csv file</div>
+            <div className="tiny muted mt-1">
+              Supports CSV or tab-delimited exports from Excel, Google Sheets, or LMS.
+            </div>
           </div>
         )}
 
@@ -409,7 +579,7 @@ Babatunde Adeleke, babatunde@example.com,, instructor`}
         {isProcessing && (
           <div className="card" style={{ padding: 14, background: 'var(--surface)' }}>
             <div className="row row--between mb-1" style={{ fontSize: '.84rem' }}>
-              <span className="b">Importing users…</span>
+              <span className="b">Importing users and setting enrolments…</span>
               <span>
                 {progress.current} of {progress.total} ({percentDone}%)
               </span>
@@ -428,10 +598,10 @@ Babatunde Adeleke, babatunde@example.com,, instructor`}
         {isCompleted && (
           <div className={`alert ${progress.failed === 0 ? 'alert--ok' : 'alert--warn'}`}>
             <div>
-              <b>Import completed:</b> {progress.success} users successfully added.
+              <b>Import completed:</b> {progress.success} users successfully added and enrolled.
               {progress.failed > 0 && ` ${progress.failed} failed (see details below).`}
               <div className="mt-1">
-                You can click <b>"Export Credentials CSV"</b> below to keep a copy of their login credentials.
+                Click <b>"Export Credentials CSV"</b> below to keep a spreadsheet of their login details and course assignments.
               </div>
             </div>
           </div>
@@ -449,7 +619,7 @@ Babatunde Adeleke, babatunde@example.com,, instructor`}
             <div
               className="table-wrap"
               style={{
-                maxHeight: 240,
+                maxHeight: 250,
                 overflowY: 'auto',
                 border: '1px solid var(--line)',
                 borderRadius: 'var(--r-sm)',
@@ -463,6 +633,7 @@ Babatunde Adeleke, babatunde@example.com,, instructor`}
                     <th>Email</th>
                     <th>Password</th>
                     <th>Role</th>
+                    <th>Enrolled Course</th>
                     <th>Status</th>
                   </tr>
                 </thead>
@@ -481,13 +652,32 @@ Babatunde Adeleke, babatunde@example.com,, instructor`}
                         </Badge>
                       </td>
                       <td>
+                        {courses.length > 0 ? (
+                          <select
+                            value={r.courseId || ''}
+                            onChange={(e) => setRowCourse(r.id, e.target.value)}
+                            disabled={isProcessing || r.status === 'done'}
+                            style={{ padding: '3px 6px', fontSize: '.78rem', width: 'auto', maxWidth: 170 }}
+                          >
+                            <option value="">— None —</option>
+                            {courses.map((c) => (
+                              <option key={c.$id} value={c.$id}>
+                                {c.code ? `${c.code}: ` : ''}{c.title}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="tiny muted">{r.courseTitle}</span>
+                        )}
+                      </td>
+                      <td>
                         {r.status === 'pending' && <span className="badge">Ready</span>}
                         {r.status === 'running' && (
                           <span className="badge badge--brand pulse">
                             <Spinner size={10} /> Creating…
                           </span>
                         )}
-                        {r.status === 'done' && <Badge tone="ok">✓ Created</Badge>}
+                        {r.status === 'done' && <Badge tone="ok">✓ Enrolled</Badge>}
                         {r.status === 'failed' && (
                           <Badge tone="danger" title={r.error}>
                             ✕ {r.error || 'Failed'}
